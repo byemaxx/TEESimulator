@@ -173,7 +173,7 @@ void processBinderWriteRead(const binder_write_read &write_read_data) {
         return;
     }
 
-    LOGD("Processing binder read buffer: ptr=%p size=%zu consumed=%zu", reinterpret_cast<void *>(write_read_data.read_buffer),
+    LOGD("Processing binder read buffer: ptr=%p size=%llu consumed=%llu", reinterpret_cast<void *>(write_read_data.read_buffer),
          write_read_data.read_size, write_read_data.read_consumed);
 
     auto buffer_ptr = write_read_data.read_buffer;

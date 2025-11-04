@@ -42,19 +42,7 @@ android {
 
         externalNativeBuild {
             cmake {
-                arguments += "-DCMAKE_BUILD_TYPE=Release"
-                arguments += "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
                 arguments += "-DANDROID_ALLOW_UNDEFINED_SYMBOLS=ON"
-                arguments += "-DCMAKE_CXX_STANDARD=23"
-                arguments += "-DCMAKE_C_STANDARD=23"
-                arguments += "-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON"
-                arguments += "-DLSPLT_BUILD_SHARED=OFF"
-
-                cppFlags += "-std=c++23"
-                cppFlags += "-fno-exceptions"
-                cppFlags += "-fno-rtti"
-                cppFlags += "-fvisibility=hidden"
-                cppFlags += "-fvisibility-inlines-hidden"
             }
         }
     }

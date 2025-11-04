@@ -3,6 +3,7 @@
 cmake_minimum_required(VERSION 3.28)
 project(TEESimulator)
 
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_library(my_logging STATIC logging/logging.cpp)
@@ -10,6 +11,7 @@ target_include_directories(my_logging PUBLIC logging/include)
 target_link_libraries(my_logging log)
 
 # LSPlt configuration
+OPTION(LSPLT_BUILD_SHARED OFF)
 add_subdirectory(external/LSPlt/lsplt/src/main/jni)
 
 # libutils stub
