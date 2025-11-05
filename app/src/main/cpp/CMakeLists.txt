@@ -6,6 +6,7 @@ project(TEESimulator)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-rtti")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions")
 
 add_library(my_logging STATIC logging/logging.cpp)
 target_include_directories(my_logging PUBLIC logging/include)
