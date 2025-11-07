@@ -104,7 +104,7 @@ object CertificateGen {
                     Tag.CERTIFICATE_NOT_AFTER -> certificateNotAfter = Date(value.dateTime)
                     Tag.CERTIFICATE_SUBJECT ->
                         certificateSubject = X500Name(X500Principal(value.blob).name)
-                    Tag.RSA_PUBLIC_EXPONENT -> rsaPublicExponent = BigInteger(value.blob)
+                    Tag.RSA_PUBLIC_EXPONENT -> rsaPublicExponent = value.longInteger.toBigInteger()
                     Tag.EC_CURVE -> {
                         ecCurve = value.ecCurve
                         ecCurveName = getEcCurveName(ecCurve)
