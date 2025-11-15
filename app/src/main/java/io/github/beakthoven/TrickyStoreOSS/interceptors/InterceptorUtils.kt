@@ -12,6 +12,9 @@ import android.os.ServiceManager
 import android.security.KeyStore
 import android.security.keystore.KeystoreResponse
 import io.github.beakthoven.TrickyStoreOSS.logging.Logger
+import java.security.MessageDigest
+import java.security.cert.Certificate
+import java.util.Base64
 import kotlin.system.exitProcess
 
 abstract class BaseKeystoreInterceptor : BinderInterceptor() {
@@ -149,5 +152,20 @@ object InterceptorUtils {
 
     fun Parcel.hasException(): Boolean {
         return kotlin.runCatching { readException() }.exceptionOrNull() != null
+    }
+}
+
+fun getPublicKeyFingerprint(chain: Array<Certificate>?): String? {
+    if (chain.isNullOrEmpty()) return null
+    return try {
+        val leafCert = chain[0]
+        val publicKeyBytes = leafCert.publicKey.encoded
+        val digest = MessageDigest.getInstance("SHA-256")
+        val hashBytes = digest.digest(publicKeyBytes)
+        // Using a URL-safe encoder is good practice for hashes.
+        Base64.getUrlEncoder().withoutPadding().encodeToString(hashBytes)
+    } catch (e: Exception) {
+        Logger.e("Failed to create public key fingerprint", e)
+        null
     }
 }

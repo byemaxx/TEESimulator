@@ -15,27 +15,40 @@ import io.github.beakthoven.TrickyStoreOSS.AttestUtils.TEEStatus
 import io.github.beakthoven.TrickyStoreOSS.KeyBoxUtils
 import io.github.beakthoven.TrickyStoreOSS.logging.Logger
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 
 object PkgConfig {
     private val hackPackages = mutableSetOf<String>()
     private val generatePackages = mutableSetOf<String>()
-    private val packageModes = mutableMapOf<String, Mode>()
 
-    private val packageKeyboxes = mutableMapOf<String, String>()
+    @Volatile private var packageModes = mutableMapOf<String, Mode>()
+    @Volatile private var packageKeyboxes = mutableMapOf<String, String>()
+
+    private val uidToPackagesCache = ConcurrentHashMap<Int, Array<String>>()
+
     private val keyboxRegex = Regex("^\\[([a-zA-Z0-9_.-]+\\.xml)]$")
     private const val DEFAULT_KEYBOX_FILE = "keybox.xml"
 
-    fun getKeyboxFileForUid(callingUid: Int): String =
-        runCatching {
-                val ps = getPm()?.getPackagesForUid(callingUid) ?: return DEFAULT_KEYBOX_FILE
-                for (pkg in ps) {
-                    packageKeyboxes[pkg]?.let {
-                        return it
-                    }
-                }
-                return DEFAULT_KEYBOX_FILE
+    fun getKeyboxFileForUid(callingUid: Int): String {
+        val packages = getPackagesForUid(callingUid)
+        for (pkg in packages) {
+            packageKeyboxes[pkg]?.let {
+                return it
             }
-            .getOrDefault(DEFAULT_KEYBOX_FILE)
+        }
+        return DEFAULT_KEYBOX_FILE
+    }
+
+    fun getPackagesForUid(uid: Int): Array<String> {
+        return uidToPackagesCache.getOrPut(uid) {
+            try {
+                getPm()?.getPackagesForUid(uid) ?: emptyArray()
+            } catch (e: Exception) {
+                Logger.w("Failed to get packages for UID $uid", e)
+                emptyArray()
+            }
+        }
+    }
 
     enum class Mode {
         AUTO,
@@ -47,8 +60,10 @@ object PkgConfig {
         runCatching {
                 hackPackages.clear()
                 generatePackages.clear()
-                packageModes.clear()
-                packageKeyboxes.clear()
+
+                // Build new maps locally to ensure atomic update
+                val newPackageModes = mutableMapOf<String, Mode>()
+                val newPackageKeyboxes = mutableMapOf<String, String>()
 
                 var currentKeyboxFile = DEFAULT_KEYBOX_FILE
 
@@ -71,22 +86,25 @@ object PkgConfig {
                         n.endsWith("!") -> {
                             val pkg = n.removeSuffix("!").trim()
                             generatePackages.add(pkg)
-                            packageModes[pkg] = Mode.GENERATE
-                            packageKeyboxes[pkg] = currentKeyboxFile
+                            newPackageModes[pkg] = Mode.GENERATE
+                            newPackageKeyboxes[pkg] = currentKeyboxFile
                         }
                         n.endsWith("?") -> {
                             val pkg = n.removeSuffix("?").trim()
                             hackPackages.add(pkg)
-                            packageModes[pkg] = Mode.LEAF_HACK
-                            packageKeyboxes[pkg] = currentKeyboxFile
+                            newPackageModes[pkg] = Mode.LEAF_HACK
+                            newPackageKeyboxes[pkg] = currentKeyboxFile
                         }
                         else -> {
                             // Auto mode
-                            packageModes[n] = Mode.AUTO
-                            packageKeyboxes[n] = currentKeyboxFile
+                            newPackageModes[n] = Mode.AUTO
+                            newPackageKeyboxes[n] = currentKeyboxFile
                         }
                     }
                 }
+                packageModes = newPackageModes
+                packageKeyboxes = newPackageKeyboxes
+                uidToPackagesCache.clear()
                 Logger.i(
                     "update hack packages: $hackPackages, generate packages=$generatePackages, packageModes=$packageModes, , packageKeyboxes=$packageKeyboxes"
                 )
@@ -192,43 +210,37 @@ object PkgConfig {
         return iPm
     }
 
-    fun needHack(callingUid: Int): Boolean =
-        kotlin
-            .runCatching {
-                val ps = getPm()?.getPackagesForUid(callingUid) ?: return false
-                if (teeBroken == null) loadTEEStatus(root)
-                for (pkg in ps) {
-                    when (packageModes[pkg]) {
-                        Mode.LEAF_HACK -> return true
-                        Mode.AUTO -> {
-                            if (teeBroken == false) return true
-                        }
-                        else -> {}
-                    }
-                }
-                return false
-            }
-            .onFailure { Logger.e("failed to get packages", it) }
-            .getOrNull() ?: false
+    fun needHack(callingUid: Int): Boolean {
+        return getPackageModeForUid(callingUid) == Mode.LEAF_HACK
+    }
 
-    fun needGenerate(callingUid: Int): Boolean =
-        kotlin
-            .runCatching {
-                val ps = getPm()?.getPackagesForUid(callingUid) ?: return false
-                if (teeBroken == null) loadTEEStatus(root)
-                for (pkg in ps) {
-                    when (packageModes[pkg]) {
-                        Mode.GENERATE -> return true
-                        Mode.AUTO -> {
-                            if (teeBroken == true) return true
-                        }
-                        else -> {}
+    fun needGenerate(callingUid: Int): Boolean {
+        return getPackageModeForUid(callingUid) == Mode.GENERATE
+    }
+
+    private fun getPackageModeForUid(uid: Int): Mode? {
+        return try {
+            val packages = getPackagesForUid(uid)
+            if (packages.isEmpty()) return null
+
+            if (teeBroken == null) loadTEEStatus(root)
+
+            for (pkg in packages) {
+                when (packageModes[pkg]) {
+                    Mode.GENERATE -> return Mode.GENERATE
+                    Mode.LEAF_HACK -> return Mode.LEAF_HACK
+                    Mode.AUTO -> {
+                        return if (teeBroken == true) Mode.GENERATE else Mode.LEAF_HACK
                     }
+                    else -> {} // Continue to check other packages for the same UID
                 }
-                return false
             }
-            .onFailure { Logger.e("failed to get packages", it) }
-            .getOrNull() ?: false
+            null
+        } catch (e: Exception) {
+            Logger.e("Failed to determine mode for UID $uid", e)
+            null
+        }
+    }
 
     @Volatile var _customPatchLevel: CustomPatchLevel? = null
 

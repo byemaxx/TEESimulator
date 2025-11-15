@@ -8,6 +8,7 @@ package io.github.beakthoven.TrickyStoreOSS.interceptors
 import android.os.Binder
 import android.os.IBinder
 import android.os.Parcel
+import io.github.beakthoven.TrickyStoreOSS.config.PkgConfig
 import io.github.beakthoven.TrickyStoreOSS.logging.Logger
 
 open class BinderInterceptor : Binder() {
@@ -80,6 +81,7 @@ open class BinderInterceptor : Binder() {
     }
 
     open fun onPreTransact(
+        txId: Long,
         target: IBinder,
         code: Int,
         flags: Int,
@@ -89,6 +91,7 @@ open class BinderInterceptor : Binder() {
     ): Result = Skip
 
     open fun onPostTransact(
+        txId: Long,
         target: IBinder,
         code: Int,
         flags: Int,
@@ -99,11 +102,33 @@ open class BinderInterceptor : Binder() {
         resultCode: Int,
     ): Result = Skip
 
+    fun logging(
+        txId: Long,
+        transact: String,
+        callingUid: Int,
+        callingPid: Int,
+        data: Parcel,
+        observe: Boolean = true,
+    ) {
+        val action = if (observe) "Observe" else "Intercept"
+        val packages = PkgConfig.getPackagesForUid(callingUid)
+        val packageInfo =
+            if (packages.isNotEmpty()) {
+                "packages=[${packages.joinToString()}]"
+            } else {
+                "packages=[]"
+            }
+        Logger.d(
+            "[TX_ID: $txId] $action $transact $packageInfo (uid=$callingUid), pid=$callingPid, dataSz=${data.dataSize()}"
+        )
+    }
+
     override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+        val txId = data.readLong()
         val result =
             when (code) {
-                PRE_TRANSACT_CODE -> handlePreTransact(data)
-                POST_TRANSACT_CODE -> handlePostTransact(data)
+                PRE_TRANSACT_CODE -> handlePreTransact(txId, data)
+                POST_TRANSACT_CODE -> handlePostTransact(txId, data)
                 else -> return super.onTransact(code, data, reply, flags)
             }
 
@@ -111,7 +136,7 @@ open class BinderInterceptor : Binder() {
         return true
     }
 
-    private fun handlePreTransact(data: Parcel): Result {
+    private fun handlePreTransact(txId: Long, data: Parcel): Result {
         val target = data.readStrongBinder()
         val transactionCode = data.readInt()
         val transactionFlags = data.readInt()
@@ -124,6 +149,7 @@ open class BinderInterceptor : Binder() {
             transactionData.appendFrom(data, data.dataPosition(), dataSize.toInt())
             transactionData.setDataPosition(0)
             onPreTransact(
+                txId,
                 target,
                 transactionCode,
                 transactionFlags,
@@ -136,7 +162,7 @@ open class BinderInterceptor : Binder() {
         }
     }
 
-    private fun handlePostTransact(data: Parcel): Result {
+    private fun handlePostTransact(txId: Long, data: Parcel): Result {
         val target = data.readStrongBinder()
         val transactionCode = data.readInt()
         val transactionFlags = data.readInt()
@@ -162,6 +188,7 @@ open class BinderInterceptor : Binder() {
                 } else null
 
             onPostTransact(
+                txId,
                 target,
                 transactionCode,
                 transactionFlags,

@@ -58,6 +58,7 @@ object KeystoreInterceptor : BaseKeystoreInterceptor() {
     data class Key(val uid: Int, val alias: String)
 
     override fun onPreTransact(
+        txId: Long,
         target: IBinder,
         code: Int,
         flags: Int,
@@ -245,6 +246,7 @@ object KeystoreInterceptor : BaseKeystoreInterceptor() {
     }
 
     override fun onPostTransact(
+        txId: Long,
         target: IBinder,
         code: Int,
         flags: Int,

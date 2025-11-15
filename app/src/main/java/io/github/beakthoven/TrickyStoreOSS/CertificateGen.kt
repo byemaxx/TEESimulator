@@ -93,7 +93,7 @@ object CertificateGen {
 
         constructor(params: Array<KeyParameter>) : this() {
             params.forEach { param ->
-                Logger.d("Processing key parameter: ${param.tag}")
+                Logger.d("[KeyGen] Processing key parameter: ${param.tag}")
                 val value = param.value
 
                 when (param.tag) {

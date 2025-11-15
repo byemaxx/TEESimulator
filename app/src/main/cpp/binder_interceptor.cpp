@@ -10,16 +10,15 @@
 #include <sys/ioctl.h>
 #include <utils/StrongPointer.h>
 
+#include <atomic>
+#include <cinttypes>
 #include <map>
-#include <memory>
 #include <mutex>
 #include <queue>
 #include <shared_mutex>
-#include <span>
 #include <string_view>
 #include <thread>
 #include <utility>
-#include <vector>
 
 #include "logging.hpp"
 #include "lsplt.hpp"
@@ -43,6 +42,8 @@ constexpr uint32_t kBackdoorCode = 0xdeadbeef;
 } // namespace intercept_constants
 } // namespace
 
+static std::atomic<uint64_t> g_transaction_id_counter = 0;
+
 class BinderInterceptor : public BBinder {
     struct InterceptorRegistration {
         wp<IBinder> target_binder{};
@@ -62,7 +63,7 @@ class BinderInterceptor : public BBinder {
 public:
     status_t onTransact(uint32_t code, const android::Parcel &data, android::Parcel *reply, uint32_t flags) override;
 
-    bool handleInterceptedTransaction(sp<BBinder> target_binder, uint32_t transaction_code, const Parcel &request_data,
+    bool handleInterceptedTransaction(uint64_t tx_id, sp<BBinder> target_binder, uint32_t transaction_code, const Parcel &request_data,
                                       Parcel *reply_data, uint32_t transaction_flags, status_t &result);
 
     bool shouldInterceptBinder(const wp<BBinder> &target_binder) const;
@@ -72,7 +73,7 @@ private:
     status_t handleUnregisterInterceptor(const android::Parcel &data);
 
     template <typename ParcelWriter>
-    status_t writeInterceptorCallData(ParcelWriter &writer, sp<BBinder> target_binder, uint32_t transaction_code,
+    status_t writeInterceptorCallData(uint64_t tx_id, ParcelWriter &writer, sp<BBinder> target_binder, uint32_t transaction_code,
                                       uint32_t transaction_flags, const Parcel &data) const;
 
     status_t validateInterceptorResponse(const Parcel &response, int32_t &action_type) const;
@@ -81,11 +82,13 @@ private:
 static sp<BinderInterceptor> g_binder_interceptor = nullptr;
 
 struct ThreadTransactionInfo {
+    uint64_t transaction_id;
     uint32_t transaction_code;
     wp<BBinder> target_binder;
 
     ThreadTransactionInfo() = default;
-    ThreadTransactionInfo(uint32_t code, wp<BBinder> target) : transaction_code(code), target_binder(std::move(target)) {}
+    ThreadTransactionInfo(uint64_t id, uint32_t code, wp<BBinder> target)
+        : transaction_id(id), transaction_code(code), target_binder(std::move(target)) {}
 };
 
 // A thread-safe map to hold a queue of transactions for each thread.
@@ -131,16 +134,16 @@ class BinderStub : public BBinder {
         }
 
         if (auto promoted_target = transaction_info.target_binder.promote()) {
-            LOGD("Processing intercepted transaction");
+            LOGD("[TX_ID: %" PRIu64 "] Processing intercepted transaction", transaction_info.transaction_id);
             status_t result;
-            if (!g_binder_interceptor->handleInterceptedTransaction(promoted_target, transaction_info.transaction_code, data, reply,
-                                                                    flags, result)) {
-                LOGD("Forwarding to original binder");
+            if (!g_binder_interceptor->handleInterceptedTransaction(transaction_info.transaction_id, promoted_target,
+                                                                    transaction_info.transaction_code, data, reply, flags, result)) {
+                LOGD("[TX_ID: %" PRIu64 "] Forwarding to original binder", transaction_info.transaction_id);
                 result = promoted_target->transact(transaction_info.transaction_code, data, reply, flags);
             }
             return result;
         } else {
-            LOGE("Failed to promote weak reference to target binder");
+            LOGE("[TX_ID: %" PRIu64 "] Failed to promote weak reference to target binder", transaction_info.transaction_id);
             return DEAD_OBJECT;
         }
     }
@@ -181,10 +184,12 @@ bool processBinderTransaction(binder_transaction_data *transaction_data) {
     }
 
     if (should_intercept) {
-        LOGD("Redirecting transaction through stub");
+        int64_t new_id = ++g_transaction_id_counter;
+        LOGD("[TX_ID: %" PRIu64 "] Redirecting transaction through stub", new_id);
         transaction_data->target.ptr = reinterpret_cast<uintptr_t>(g_binder_stub->getWeakRefs());
         transaction_data->cookie = reinterpret_cast<uintptr_t>(g_binder_stub.get());
         transaction_data->code = intercept_constants::kBackdoorCode;
+        transaction_info.transaction_id = new_id;
         // Get the queue for the current thread (or create it if it doesn't exist)
         // and push the transaction info.
         g_thread_transaction_map[std::this_thread::get_id()].push(std::move(transaction_info));
@@ -198,8 +203,8 @@ void processBinderWriteRead(const binder_write_read &write_read_data) {
         return;
     }
 
-    LOGD("Processing binder read buffer: ptr=%p size=%llu consumed=%llu", reinterpret_cast<void *>(write_read_data.read_buffer),
-         write_read_data.read_size, write_read_data.read_consumed);
+    LOGD("[ioctl] Read buffer: ptr=%p size=%llu consumed=%llu",
+         reinterpret_cast<void *>(write_read_data.read_buffer), write_read_data.read_size, write_read_data.read_consumed);
 
     auto buffer_ptr = write_read_data.read_buffer;
     auto remaining_bytes = write_read_data.read_consumed;
@@ -215,7 +220,7 @@ void processBinderWriteRead(const binder_write_read &write_read_data) {
         remaining_bytes -= sizeof(uint32_t);
 
         auto command_size = _IOC_SIZE(command);
-        LOGD("Processing binder command: %u (size: %u)", command, command_size);
+        LOGD("[ioctl] Command: %u (size: %u)", command, command_size);
 
         if (remaining_bytes < command_size) {
             LOGE("Insufficient bytes for command data: %llu < %u", static_cast<unsigned long long>(remaining_bytes), command_size);
@@ -226,18 +231,18 @@ void processBinderWriteRead(const binder_write_read &write_read_data) {
             binder_transaction_data *transaction_data = nullptr;
 
             if (command == BR_TRANSACTION_SEC_CTX) {
-                LOGD("Processing BR_TRANSACTION_SEC_CTX");
+                LOGD("[ioctl] BR_TRANSACTION_SEC_CTX");
                 auto *secctx_data = reinterpret_cast<const binder_transaction_data_secctx *>(buffer_ptr);
                 transaction_data = const_cast<binder_transaction_data *>(&secctx_data->transaction_data);
             } else {
-                LOGD("Processing BR_TRANSACTION");
+                LOGD("[ioctl] BR_TRANSACTION");
                 transaction_data = reinterpret_cast<binder_transaction_data *>(buffer_ptr);
             }
 
             if (transaction_data) {
                 processBinderTransaction(transaction_data);
             } else {
-                LOGE("Failed to extract transaction data");
+                LOGE("[ioctl] Failed to extract transaction data");
             }
         }
 
@@ -352,15 +357,16 @@ status_t BinderInterceptor::handleUnregisterInterceptor(const android::Parcel &d
     }
 }
 
-bool BinderInterceptor::handleInterceptedTransaction(sp<BBinder> target_binder, uint32_t transaction_code, const Parcel &request_data,
-                                                     Parcel *reply_data, uint32_t transaction_flags, status_t &result) {
-#define VALIDATE_STATUS(expr)                                   \
-    do {                                                        \
-        auto __result = (expr);                                 \
-        if (__result != OK) {                                   \
-            LOGE("Operation failed: " #expr " = %d", __result); \
-            return false;                                       \
-        }                                                       \
+bool BinderInterceptor::handleInterceptedTransaction(uint64_t tx_id, sp<BBinder> target_binder, uint32_t transaction_code,
+                                                     const Parcel &request_data, Parcel *reply_data, uint32_t transaction_flags,
+                                                     status_t &result) {
+#define VALIDATE_STATUS(expr)                                                               \
+    do {                                                                                    \
+        auto __result = (expr);                                                             \
+        if (__result != OK) {                                                               \
+            LOGE("[TX_ID: %" PRIu64 "] Operation failed: " #expr " = %d", tx_id, __result); \
+            return false;                                                                   \
+        }                                                                                   \
     } while (0)
 
     sp<IBinder> interceptor_binder;
@@ -368,24 +374,25 @@ bool BinderInterceptor::handleInterceptedTransaction(sp<BBinder> target_binder, 
         ReadGuard read_guard{interceptor_registry_lock_};
         auto iterator = interceptor_registry_.find(target_binder);
         if (iterator == interceptor_registry_.end()) {
-            LOGE("No interceptor found for target binder %p", target_binder.get());
+            LOGE("[TX_ID: %" PRIu64 "] No interceptor found for target binder %p", tx_id, target_binder.get());
             return false;
         }
         interceptor_binder = iterator->second.interceptor_binder;
     }
 
-    LOGD("Intercepting transaction: binder=%p code=%u flags=%u reply=%s", target_binder.get(), transaction_code, transaction_flags,
-         reply_data ? "true" : "false");
+    LOGD("[TX_ID: %" PRIu64 "] Intercepting transaction: binder=%p code=%u flags=%u reply=%s", tx_id, target_binder.get(),
+         transaction_code, transaction_flags, reply_data ? "true" : "false");
 
     Parcel pre_request_data, pre_response_data, modified_request_data;
 
-    VALIDATE_STATUS(writeInterceptorCallData(pre_request_data, target_binder, transaction_code, transaction_flags, request_data));
+    VALIDATE_STATUS(
+        writeInterceptorCallData(tx_id, pre_request_data, target_binder, transaction_code, transaction_flags, request_data));
     VALIDATE_STATUS(interceptor_binder->transact(intercept_constants::kPreTransact, pre_request_data, &pre_response_data));
 
     int32_t pre_action_type;
     VALIDATE_STATUS(validateInterceptorResponse(pre_response_data, pre_action_type));
 
-    LOGD("Pre-transaction action type: %d", pre_action_type);
+    LOGD("[TX_ID: %" PRIu64 "] Pre-transaction action type: %d", tx_id, pre_action_type);
 
     switch (pre_action_type) {
     case intercept_constants::kActionSkip:
@@ -415,6 +422,7 @@ bool BinderInterceptor::handleInterceptedTransaction(sp<BBinder> target_binder, 
 
     Parcel post_request_data, post_response_data;
 
+    VALIDATE_STATUS(post_request_data.writeInt64(tx_id));
     VALIDATE_STATUS(post_request_data.writeStrongBinder(target_binder));
     VALIDATE_STATUS(post_request_data.writeUint32(transaction_code));
     VALIDATE_STATUS(post_request_data.writeUint32(transaction_flags));
@@ -426,7 +434,7 @@ bool BinderInterceptor::handleInterceptedTransaction(sp<BBinder> target_binder, 
 
     size_t reply_size = reply_data ? reply_data->dataSize() : 0;
     VALIDATE_STATUS(post_request_data.writeUint64(reply_size));
-    LOGD("Transaction sizes: request=%zu reply=%zu", request_data.dataSize(), reply_size);
+    LOGD("[TX_ID: %" PRIu64 "] Transaction sizes: request=%zu reply=%zu", tx_id, request_data.dataSize(), reply_size);
 
     if (reply_data && reply_size > 0) {
         VALIDATE_STATUS(post_request_data.appendFrom(reply_data, 0, reply_size));
@@ -437,7 +445,7 @@ bool BinderInterceptor::handleInterceptedTransaction(sp<BBinder> target_binder, 
     int32_t post_action_type;
     VALIDATE_STATUS(validateInterceptorResponse(post_response_data, post_action_type));
 
-    LOGD("Post-transaction action type: %d", post_action_type);
+    LOGD("[TX_ID: %" PRIu64 "] Post-transaction action type: %d", tx_id, post_action_type);
 
     if (post_action_type == intercept_constants::kActionOverrideReply) {
         result = post_response_data.readInt32();
@@ -445,7 +453,7 @@ bool BinderInterceptor::handleInterceptedTransaction(sp<BBinder> target_binder, 
             size_t new_reply_size = post_response_data.readUint64();
             reply_data->freeData();
             VALIDATE_STATUS(reply_data->appendFrom(&post_response_data, post_response_data.dataPosition(), new_reply_size));
-            LOGD("Reply overridden: original_size=%zu new_size=%zu", reply_size, new_reply_size);
+            LOGD("[TX_ID: %" PRIu64 "] Reply overridden: original_size=%zu new_size=%zu", tx_id, reply_size, new_reply_size);
         }
     }
 
@@ -455,9 +463,13 @@ bool BinderInterceptor::handleInterceptedTransaction(sp<BBinder> target_binder, 
 }
 
 template <typename ParcelWriter>
-status_t BinderInterceptor::writeInterceptorCallData(ParcelWriter &writer, sp<BBinder> target_binder, uint32_t transaction_code,
-                                                     uint32_t transaction_flags, const Parcel &data) const {
-    auto status = writer.writeStrongBinder(target_binder);
+status_t BinderInterceptor::writeInterceptorCallData(uint64_t tx_id, ParcelWriter &writer, sp<BBinder> target_binder,
+                                                     uint32_t transaction_code, uint32_t transaction_flags, const Parcel &data) const {
+    auto status = writer.writeInt64(tx_id);
+    if (status != OK)
+        return status;
+
+    status = writer.writeStrongBinder(target_binder);
     if (status != OK)
         return status;
 
@@ -555,7 +567,7 @@ bool initializeBinderInterception() {
 
 extern "C" [[gnu::visibility("default")]] [[gnu::used]]
 bool entry(void *library_handle) {
-    LOGI("TrickyStore binder interceptor loaded (handle: %p)", library_handle);
+    LOGI("TEESimulator binder interceptor loaded (handle: %p)", library_handle);
 
     bool success = initializeBinderInterception();
     if (success) {

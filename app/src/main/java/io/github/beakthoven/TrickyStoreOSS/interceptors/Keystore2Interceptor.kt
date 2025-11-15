@@ -24,10 +24,18 @@ import io.github.beakthoven.TrickyStoreOSS.putCertificateChain
 
 @SuppressLint("BlockedPrivateApi")
 object Keystore2Interceptor : BaseKeystoreInterceptor() {
+    private val getSecurityLevelTransaction =
+        getTransactCode(IKeystoreService.Stub::class.java, "getSecurityLevel")
     private val getKeyEntryTransaction =
         getTransactCode(IKeystoreService.Stub::class.java, "getKeyEntry")
+    private val updateSubcomponentTransaction =
+        getTransactCode(IKeystoreService.Stub::class.java, "updateSubcomponent")
+    private val listEntriesTransaction =
+        getTransactCode(IKeystoreService.Stub::class.java, "listEntries")
     private val deleteKeyTransaction =
         getTransactCode(IKeystoreService.Stub::class.java, "deleteKey")
+    private val grantTransaction = getTransactCode(IKeystoreService.Stub::class.java, "grant")
+    private val ungrantTransaction = getTransactCode(IKeystoreService.Stub::class.java, "ungrant")
 
     override val serviceName = "android.system.keystore2.IKeystoreService/default"
     override val processName = "keystore2"
@@ -69,6 +77,7 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
     }
 
     override fun onPreTransact(
+        txId: Long,
         target: IBinder,
         code: Int,
         flags: Int,
@@ -76,25 +85,48 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
         callingPid: Int,
         data: Parcel,
     ): Result {
-        if (code == getKeyEntryTransaction) {
-            if (KeyBoxUtils.hasKeyboxes()) {
-                Logger.d(
-                    "intercept pre  $target uid=$callingUid pid=$callingPid dataSz=${data.dataSize()}"
-                )
+        when (code) {
+            getSecurityLevelTransaction -> {
+                logging(txId, "getSecurityLevel", callingUid, callingPid, data)
+            }
+            updateSubcomponentTransaction -> {
+                logging(txId, "updateSubcomponent", callingUid, callingPid, data)
+            }
+            listEntriesTransaction -> {
+                logging(txId, "listEntries", callingUid, callingPid, data)
+            }
+            deleteKeyTransaction -> {
+                logging(txId, "deleteKey", callingUid, callingPid, data)
+                return Continue
+            }
+            grantTransaction -> {
+                logging(txId, "grant", callingUid, callingPid, data)
+            }
+            ungrantTransaction -> {
+                logging(txId, "ungrant", callingUid, callingPid, data)
+            }
+            getKeyEntryTransaction -> {
+                logging(txId, "getKeyEntry", callingUid, callingPid, data, false)
+                if (!KeyBoxUtils.hasKeyboxes()) return Skip
                 try {
                     data.enforceInterface(IKeystoreService.DESCRIPTOR)
                     val descriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return Skip
+                    val keyIdentifier = SecurityLevelInterceptor.Key(callingUid, descriptor.alias)
+                    Logger.i(
+                        "Checking fingerprint $keyIdentifier ${SecurityLevelInterceptor.aliasToFingerprintMap.size}"
+                    )
+                    if (SecurityLevelInterceptor.aliasToFingerprintMap.containsKey(keyIdentifier))
+                        return Continue
                     if (PkgConfig.needGenerate(callingUid)) {
-                        val response =
-                            SecurityLevelInterceptor.getKeyResponse(callingUid, descriptor.alias)
+                        val response = SecurityLevelInterceptor.getKeyResponse(keyIdentifier)
                         if (response != null) {
                             Logger.i(
-                                "Found generated response for uid=$callingUid alias=${descriptor.alias}"
+                                "[TX_ID: $txId] Found generated response for uid=$callingUid alias=${descriptor.alias}"
                             )
                             return createTypedObjectReply(response)
                         } else {
                             Logger.e(
-                                "No generated response found for uid=$callingUid alias=${descriptor.alias}"
+                                "[TX_ID: $txId] No generated response found for uid=$callingUid alias=${descriptor.alias}"
                             )
                             val nullParcel = Parcel.obtain()
                             nullParcel.writeTypedObject(null as KeyEntryResponse?, 0)
@@ -107,20 +139,18 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
                                 descriptor.alias,
                             )
                         ) {
-                            Logger.i("skip leaf hack for uid=$callingUid alias=${descriptor.alias}")
-                            val response =
-                                SecurityLevelInterceptor.getKeyResponse(
-                                    callingUid,
-                                    descriptor.alias,
-                                )
+                            Logger.i(
+                                "[TX_ID: $txId] Skip leaf hack for uid=$callingUid alias=${descriptor.alias}"
+                            )
+                            val response = SecurityLevelInterceptor.getKeyResponse(keyIdentifier)
                             if (response != null) {
                                 Logger.i(
-                                    "Found generated response for uid=$callingUid alias=${descriptor.alias}"
+                                    "[TX_ID: $txId] Found generated response for uid=$callingUid alias=${descriptor.alias}"
                                 )
                                 return createTypedObjectReply(response)
                             } else {
                                 Logger.e(
-                                    "No generated response found for uid=$callingUid alias=${descriptor.alias}"
+                                    "[TX_ID: $txId] No generated response found for uid=$callingUid alias=${descriptor.alias}"
                                 )
                                 val nullParcel = Parcel.obtain()
                                 nullParcel.writeTypedObject(null as KeyEntryResponse?, 0)
@@ -128,22 +158,24 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
                             }
                         } else {
                             Logger.i(
-                                "proceeding with leaf hack for uid=$callingUid alias=${descriptor.alias}"
+                                "[TX_ID: $txId] Proceeding with leaf hack for uid=$callingUid alias=${descriptor.alias}"
                             )
                             return Continue
                         }
                     }
-                    return Skip
                 } catch (e: Exception) {
-                    Logger.e("Exception in onPreTransact uid=$callingUid pid=$callingPid!", e)
-                    return Skip
+                    Logger.e(
+                        "[TX_ID: $txId] Exception in onPreTransact uid=$callingUid pid=$callingPid!",
+                        e,
+                    )
                 }
             }
         }
-        return Skip
+        return super.onPreTransact(txId, target, code, flags, callingUid, callingPid, data)
     }
 
     override fun onPostTransact(
+        txId: Long,
         target: IBinder,
         code: Int,
         flags: Int,
@@ -155,12 +187,9 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
     ): Result {
         if (target != keystore || reply == null) return Skip
         if (reply.hasException()) return Skip
-        val p = Parcel.obtain()
-        Logger.d(
-            "intercept post $target uid=$callingUid pid=$callingPid dataSz=${data.dataSize()} replySz=${reply.dataSize()}"
-        )
 
         if (code == deleteKeyTransaction && resultCode == 0) {
+            logging(txId, "post deleteKey", callingUid, callingPid, data, false)
             data.enforceInterface("android.system.keystore2.IKeystoreService")
 
             val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)
@@ -172,27 +201,53 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
 
             return Skip
         } else if (code == getKeyEntryTransaction) {
+            logging(txId, "post getKeyEntry", callingUid, callingPid, data, false)
             try {
-                data.enforceInterface("android.system.keystore2.IKeystoreService")
+                // We must use the certificate from the REPLY to get the hash, as that's the
+                // ground truth of what the keystore is returning at this moment.
+                val initialPosition = reply.dataPosition()
                 val response = reply.readTypedObject(KeyEntryResponse.CREATOR)
-                if (response != null) {
-                    val chain = CertificateUtils.run { response.getCertificateChain() }
-                    if (chain != null) {
-                        val newChain = CertificateHack.hackCertificateChain(chain, callingUid)
-                        response.putCertificateChain(newChain).getOrThrow()
-                        Logger.i("Hacked certificate for uid=$callingUid")
-                        return createTypedObjectReply(response)
-                    } else {
-                        p.recycle()
-                    }
-                } else {
-                    p.recycle()
+
+                if (response == null) return Skip
+                reply.setDataPosition(initialPosition) // Reset position for potential pass-through
+
+                val chain = CertificateUtils.run { response.getCertificateChain() }
+                val fingerprint = getPublicKeyFingerprint(chain)
+
+                if (
+                    fingerprint != null &&
+                        SecurityLevelInterceptor.userProvidedKeyFingerprints.contains(fingerprint)
+                ) {
+                    val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR) // For logging
+                    Logger.d("Fingerprint for ${keyDescriptor?.alias}: $fingerprint")
+                    Logger.w(
+                        "Bypassing cert hack for key '${keyDescriptor?.alias}' based on its public key fingerprint."
+                    )
+                    return Skip
+                }
+
+                // If the fingerprint is not on the ignore list, it's a legitimate target for
+                // hacking.
+                if (chain != null) {
+                    val newChain = CertificateHack.hackCertificateChain(chain, callingUid)
+                    response.putCertificateChain(newChain).getOrThrow()
+                    Logger.i("Hacked certificate for uid=$callingUid")
+                    return createTypedObjectReply(response) // Return the modified response
                 }
             } catch (t: Throwable) {
-                Logger.e("failed to hack certificate chain of uid=$callingUid pid=$callingPid!", t)
-                p.recycle()
+                Logger.e("Failed to handle getKeyEntry of uid=$callingUid pid=$callingPid!", t)
             }
         }
-        return Skip
+        return super.onPostTransact(
+            txId,
+            target,
+            code,
+            flags,
+            callingUid,
+            callingPid,
+            data,
+            reply,
+            resultCode,
+        )
     }
 }

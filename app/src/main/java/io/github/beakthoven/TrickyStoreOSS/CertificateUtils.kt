@@ -120,6 +120,25 @@ object CertificateUtils {
         }
     }
 
+    fun KeyMetadata?.getCertificateChain(): Array<Certificate>? {
+        // The `this` keyword refers to the KeyMetadata object.
+        val metadata = this ?: return null
+        val leafCert = metadata.certificate?.toCertificate() ?: return null
+
+        return when (val chainBytes = metadata.certificateChain) {
+            null -> arrayOf(leafCert) // If there's no chain, return the leaf.
+            else -> {
+                // If there is a chain, combine the leaf with the rest of the chain.
+                val additionalCerts = chainBytes.toCertificates()
+                buildList {
+                        add(leafCert)
+                        addAll(additionalCerts)
+                    }
+                    .toTypedArray()
+            }
+        }
+    }
+
     fun KeyEntryResponse.putCertificateChain(chain: Array<Certificate>): Result<Unit> {
         return runCatching { metadata.putCertificateChain(chain) }
     }

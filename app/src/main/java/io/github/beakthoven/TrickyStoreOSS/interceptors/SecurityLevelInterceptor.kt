@@ -17,8 +17,10 @@ import android.system.keystore2.KeyEntryResponse
 import android.system.keystore2.KeyMetadata
 import androidx.annotation.Keep
 import io.github.beakthoven.TrickyStoreOSS.CertificateGen
+import io.github.beakthoven.TrickyStoreOSS.CertificateUtils
 import io.github.beakthoven.TrickyStoreOSS.config.PkgConfig
 import io.github.beakthoven.TrickyStoreOSS.interceptors.InterceptorUtils.getTransactCode
+import io.github.beakthoven.TrickyStoreOSS.interceptors.InterceptorUtils.hasException
 import io.github.beakthoven.TrickyStoreOSS.logging.Logger
 import io.github.beakthoven.TrickyStoreOSS.putCertificateChain
 import java.security.KeyPair
@@ -30,30 +32,45 @@ class SecurityLevelInterceptor(
     private val level: Int,
 ) : BinderInterceptor() {
     companion object {
-        private val generateKeyTransaction =
-            getTransactCode(IKeystoreSecurityLevel.Stub::class.java, "generateKey")
-        private val deleteKeyTransaction =
-            getTransactCode(IKeystoreSecurityLevel.Stub::class.java, "deleteKey")
         private val createOperationTransaction =
             getTransactCode(IKeystoreSecurityLevel.Stub::class.java, "createOperation")
+        private val generateKeyTransaction =
+            getTransactCode(IKeystoreSecurityLevel.Stub::class.java, "generateKey")
+        private val importKeyTransaction =
+            getTransactCode(IKeystoreSecurityLevel.Stub::class.java, "importKey")
+        private val importWrappedKeyTransaction =
+            getTransactCode(IKeystoreSecurityLevel.Stub::class.java, "importWrappedKey")
+        private val deleteKeyTransaction =
+            getTransactCode(IKeystoreSecurityLevel.Stub::class.java, "deleteKey")
+        private val convertStorageKeyToEphemeralTransaction =
+            getTransactCode(IKeystoreSecurityLevel.Stub::class.java, "convertStorageKeyToEphemeral")
 
         @Keep val keys = ConcurrentHashMap<Key, Info>()
+
+        // The set of fingerprints of public keys that were user-provided.
+        @Keep val userProvidedKeyFingerprints = ConcurrentHashMap.newKeySet<String>()
+        // A map to allow for cleanup on deletion: Key(uid, alias) -> "Fingerprint"
+        @Keep val aliasToFingerprintMap = ConcurrentHashMap<Key, String>()
 
         @Keep val keyPairs = ConcurrentHashMap<Key, Pair<KeyPair, List<Certificate>>>()
 
         @Keep val skipLeafHacks = ConcurrentHashMap<Key, Boolean>()
 
+        @Keep fun getKeyResponse(key: Key): KeyEntryResponse? = keys[key]?.response
+
         @Keep
         fun getKeyResponse(uid: Int, alias: String): KeyEntryResponse? =
-            keys[Key(uid, alias)]?.response
+            getKeyResponse(Key(uid, alias))
 
         @Keep
         fun getKeyPairs(uid: Int, alias: String): Pair<KeyPair, List<Certificate>>? =
             keyPairs[Key(uid, alias)]
 
+        @Keep fun shouldSkipLeafHack(key: Key): Boolean = skipLeafHacks[key] ?: false
+
         @Keep
         fun shouldSkipLeafHack(uid: Int, alias: String): Boolean =
-            skipLeafHacks[Key(uid, alias)] ?: false
+            shouldSkipLeafHack(Key(uid, alias))
     }
 
     data class Key(val uid: Int, val alias: String)
@@ -61,6 +78,7 @@ class SecurityLevelInterceptor(
     data class Info(val keyPair: KeyPair, val response: KeyEntryResponse)
 
     override fun onPreTransact(
+        txId: Long,
         target: IBinder,
         code: Int,
         flags: Int,
@@ -68,45 +86,51 @@ class SecurityLevelInterceptor(
         callingPid: Int,
         data: Parcel,
     ): Result {
-        if (code == generateKeyTransaction) {
-            Logger.i("intercept key gen uid=$callingUid pid=$callingPid")
-            kotlin
-                .runCatching {
-                    data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
-                    val keyDescriptor =
-                        data.readTypedObject(KeyDescriptor.CREATOR) ?: return@runCatching
-                    val attestationKeyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)
-                    val params = data.createTypedArray(KeyParameter.CREATOR)!!
-                    val aFlags = data.readInt()
-                    val entropy = data.createByteArray()
-                    val kgp = CertificateGen.KeyGenParameters(params)
-                    if (PkgConfig.needGenerate(callingUid)) {
-                        val pair =
-                            CertificateGen.generateKeyPair(
-                                callingUid,
-                                keyDescriptor,
-                                attestationKeyDescriptor,
-                                kgp,
-                                level,
-                            ) ?: return@runCatching
-                        keyPairs[Key(callingUid, keyDescriptor.alias)] =
-                            Pair(pair.first, pair.second)
-                        val response =
-                            buildResponse(
-                                pair.second,
-                                kgp,
-                                attestationKeyDescriptor ?: keyDescriptor,
-                            )
-                        keys[Key(callingUid, keyDescriptor.alias)] = Info(pair.first, response)
-                        val p = Parcel.obtain()
-                        p.writeNoException()
-                        p.writeTypedObject(response.metadata, 0)
-                        return OverrideReply(0, p)
-                    } else if (PkgConfig.needHack(callingUid)) {
-                        if ((kgp.purpose.contains(7)) || (attestationKeyDescriptor != null)) {
+        when (code) {
+            createOperationTransaction -> {
+                logging(txId, "createOperation", callingUid, callingPid, data)
+            }
+            importKeyTransaction -> {
+                logging(txId, "importKey", callingUid, callingPid, data)
+                return Continue
+            }
+            importWrappedKeyTransaction -> {
+                logging(txId, "importWrappedKey", callingUid, callingPid, data)
+            }
+            convertStorageKeyToEphemeralTransaction -> {
+                logging(txId, "convertStorageKeyToEphemeral", callingUid, callingPid, data)
+            }
+            deleteKeyTransaction -> {
+                logging(txId, "deleteKey", callingUid, callingPid, data, false)
+                runCatching {
+                        data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
+                        val keyDescriptor =
+                            data.readTypedObject(KeyDescriptor.CREATOR) ?: return Skip
+                        val keyIdentifier = Key(callingUid, keyDescriptor.alias)
+
+                        val fingerprintToRemove = aliasToFingerprintMap.remove(keyIdentifier)
+                        if (fingerprintToRemove != null) {
+                            userProvidedKeyFingerprints.remove(fingerprintToRemove)
                             Logger.i(
-                                "Generating key in generation mode for attestation: uid=$callingUid alias=${keyDescriptor.alias}"
+                                "Cleaned up ignored key fingerprint for alias '${keyDescriptor.alias}' on deletion."
                             )
+                        }
+                    }
+                    .onFailure { Logger.e("Parse importKey request", it) }
+                return Skip
+            }
+            generateKeyTransaction -> {
+                logging(txId, "generateKey", callingUid, callingPid, data, false)
+                runCatching {
+                        data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
+                        val keyDescriptor =
+                            data.readTypedObject(KeyDescriptor.CREATOR) ?: return@runCatching
+                        val attestationKeyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)
+                        val params = data.createTypedArray(KeyParameter.CREATOR)!!
+                        val aFlags = data.readInt()
+                        val entropy = data.createByteArray()
+                        val kgp = CertificateGen.KeyGenParameters(params)
+                        if (PkgConfig.needGenerate(callingUid)) {
                             val pair =
                                 CertificateGen.generateKeyPair(
                                     callingUid,
@@ -124,24 +148,105 @@ class SecurityLevelInterceptor(
                                     attestationKeyDescriptor ?: keyDescriptor,
                                 )
                             keys[Key(callingUid, keyDescriptor.alias)] = Info(pair.first, response)
-                            SecurityLevelInterceptor.skipLeafHacks[
-                                    Key(callingUid, keyDescriptor.alias)] = true
                             val p = Parcel.obtain()
                             p.writeNoException()
                             p.writeTypedObject(response.metadata, 0)
                             return OverrideReply(0, p)
-                        } else {
-                            skipLeafHacks.remove(Key(callingUid, keyDescriptor.alias))
-                            Logger.i(
-                                "Cleared skip flag for non-attestation key: uid=$callingUid alias=${keyDescriptor.alias}"
-                            )
-                            return Skip
+                        } else if (PkgConfig.needHack(callingUid)) {
+                            if ((kgp.purpose.contains(7)) || (attestationKeyDescriptor != null)) {
+                                Logger.i(
+                                    "Generating key in generation mode for attestation: uid=$callingUid alias=${keyDescriptor.alias}"
+                                )
+                                val pair =
+                                    CertificateGen.generateKeyPair(
+                                        callingUid,
+                                        keyDescriptor,
+                                        attestationKeyDescriptor,
+                                        kgp,
+                                        level,
+                                    ) ?: return@runCatching
+                                keyPairs[Key(callingUid, keyDescriptor.alias)] =
+                                    Pair(pair.first, pair.second)
+                                val response =
+                                    buildResponse(
+                                        pair.second,
+                                        kgp,
+                                        attestationKeyDescriptor ?: keyDescriptor,
+                                    )
+                                keys[Key(callingUid, keyDescriptor.alias)] =
+                                    Info(pair.first, response)
+                                SecurityLevelInterceptor.skipLeafHacks[
+                                        Key(callingUid, keyDescriptor.alias)] = true
+                                val p = Parcel.obtain()
+                                p.writeNoException()
+                                p.writeTypedObject(response.metadata, 0)
+                                return OverrideReply(0, p)
+                            } else {
+                                skipLeafHacks.remove(Key(callingUid, keyDescriptor.alias))
+                                Logger.i(
+                                    "Cleared skip flag for non-attestation key: uid=$callingUid alias=${keyDescriptor.alias}"
+                                )
+                                return Skip
+                            }
                         }
                     }
-                }
-                .onFailure { Logger.e("parse key gen request", it) }
+                    .onFailure { Logger.e("Parse generateKey request", it) }
+            }
         }
-        return Skip
+        return super.onPreTransact(txId, target, code, flags, callingUid, callingPid, data)
+    }
+
+    override fun onPostTransact(
+        txId: Long,
+        target: IBinder,
+        code: Int,
+        flags: Int,
+        callingUid: Int,
+        callingPid: Int,
+        data: Parcel,
+        reply: Parcel?,
+        resultCode: Int,
+    ): Result {
+        if (reply == null || reply.hasException()) return Skip
+
+        if (code == importKeyTransaction && resultCode == 0) {
+            logging(txId, "post importKey", callingUid, callingPid, data, false)
+
+            runCatching {
+                    data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
+                    val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return Skip
+
+                    Logger.w("Remove keys ($callingUid, ${keyDescriptor.alias})")
+                    SecurityLevelInterceptor.keys.remove(
+                        SecurityLevelInterceptor.Key(callingUid, keyDescriptor.alias)
+                    )
+
+                    val metadata = reply.readTypedObject(KeyMetadata.CREATOR)
+                    val chain = CertificateUtils.run { metadata.getCertificateChain() }
+                    val fingerprint = getPublicKeyFingerprint(chain)
+                    Logger.d("Fingerprint for ${keyDescriptor.alias}: $fingerprint")
+                    if (fingerprint != null) {
+                        val keyIdentifier = Key(callingUid, keyDescriptor.alias)
+                        Logger.w(
+                            "Key '${keyDescriptor.alias}' imported. Storing fingerprint to ignore list."
+                        )
+                        userProvidedKeyFingerprints.add(fingerprint)
+                        aliasToFingerprintMap[keyIdentifier] = fingerprint
+                    }
+                }
+                .onFailure { Logger.e("Parse importKey request", it) }
+        }
+        return super.onPostTransact(
+            txId,
+            target,
+            code,
+            flags,
+            callingUid,
+            callingPid,
+            data,
+            reply,
+            resultCode,
+        )
     }
 
     private fun buildResponse(
