@@ -112,9 +112,6 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
                     data.enforceInterface(IKeystoreService.DESCRIPTOR)
                     val descriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return Skip
                     val keyIdentifier = SecurityLevelInterceptor.Key(callingUid, descriptor.alias)
-                    Logger.i(
-                        "Checking fingerprint $keyIdentifier ${SecurityLevelInterceptor.aliasToFingerprintMap.size}"
-                    )
                     if (SecurityLevelInterceptor.aliasToFingerprintMap.containsKey(keyIdentifier))
                         return Continue
                     if (PkgConfig.needGenerate(callingUid)) {

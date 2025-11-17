@@ -103,25 +103,7 @@ object CertificateUtils {
             .onFailure { Logger.w("Failed to convert certificates to byte array list", it) }
             .getOrNull()
 
-    fun KeyEntryResponse?.getCertificateChain(): Array<Certificate>? {
-        val metadata = this?.metadata ?: return null
-        val leafCert = metadata.certificate?.toCertificate() ?: return null
-
-        return when (val chainBytes = metadata.certificateChain) {
-            null -> arrayOf(leafCert)
-            else -> {
-                val additionalCerts = chainBytes.toCertificates()
-                buildList {
-                        add(leafCert)
-                        addAll(additionalCerts)
-                    }
-                    .toTypedArray()
-            }
-        }
-    }
-
     fun KeyMetadata?.getCertificateChain(): Array<Certificate>? {
-        // The `this` keyword refers to the KeyMetadata object.
         val metadata = this ?: return null
         val leafCert = metadata.certificate?.toCertificate() ?: return null
 
@@ -137,6 +119,10 @@ object CertificateUtils {
                     .toTypedArray()
             }
         }
+    }
+
+    fun KeyEntryResponse?.getCertificateChain(): Array<Certificate>? {
+        return this?.metadata?.getCertificateChain()
     }
 
     fun KeyEntryResponse.putCertificateChain(chain: Array<Certificate>): Result<Unit> {
