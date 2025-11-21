@@ -153,7 +153,9 @@ class SecurityLevelInterceptor(
                             p.writeTypedObject(response.metadata, 0)
                             return OverrideReply(0, p)
                         } else if (PkgConfig.needHack(callingUid)) {
-                            if ((kgp.purpose.contains(7)) || (attestationKeyDescriptor != null)) {
+                            if (
+                                kgp.attestationChallenge != null || attestationKeyDescriptor != null
+                            ) {
                                 Logger.i(
                                     "Generating key in generation mode for attestation: uid=$callingUid alias=${keyDescriptor.alias}"
                                 )
