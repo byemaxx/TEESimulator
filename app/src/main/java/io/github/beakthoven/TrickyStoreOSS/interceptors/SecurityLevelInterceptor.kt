@@ -11,6 +11,7 @@ import android.hardware.security.keymint.Tag
 import android.os.IBinder
 import android.os.Parcel
 import android.system.keystore2.Authorization
+import android.system.keystore2.CreateOperationResponse
 import android.system.keystore2.IKeystoreSecurityLevel
 import android.system.keystore2.KeyDescriptor
 import android.system.keystore2.KeyEntryResponse
@@ -89,6 +90,7 @@ class SecurityLevelInterceptor(
         when (code) {
             createOperationTransaction -> {
                 logging(txId, "createOperation", callingUid, callingPid, data)
+                return Continue
             }
             importKeyTransaction -> {
                 logging(txId, "importKey", callingUid, callingPid, data)
@@ -209,7 +211,21 @@ class SecurityLevelInterceptor(
         reply: Parcel?,
         resultCode: Int,
     ): Result {
-        if (reply == null || reply.hasException()) return Skip
+        if (reply == null) return Skip
+        if (reply.hasException()) return Skip
+
+        if (code == createOperationTransaction) {
+            logging(txId, "post createOperation", callingUid, callingPid, data, false)
+            Logger.w("resultCode is $resultCode")
+            reply.setDataPosition(0)
+            runCatching {
+                // A non-zero value usually indicates a framework-level exception was thrown.
+                val exceptionCode = reply.readInt()
+                val response = reply.readTypedObject(CreateOperationResponse.CREATOR)
+
+                Logger.i(" Reply exception code: $exceptionCode")
+            }
+        }
 
         if (code == importKeyTransaction && resultCode == 0) {
             logging(txId, "post importKey", callingUid, callingPid, data, false)
