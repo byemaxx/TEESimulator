@@ -7,8 +7,10 @@ package io.github.beakthoven.TrickyStoreOSS
 
 import android.content.pm.PackageManager
 import android.hardware.security.keymint.Algorithm
+import android.hardware.security.keymint.Digest
 import android.hardware.security.keymint.EcCurve
 import android.hardware.security.keymint.KeyParameter
+import android.hardware.security.keymint.KeyPurpose
 import android.hardware.security.keymint.Tag
 import android.os.Build
 import android.security.keystore.KeyProperties
@@ -48,6 +50,110 @@ import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
 import org.bouncycastle.jce.provider.BouncyCastleProvider
 import org.bouncycastle.openssl.PEMKeyPair
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
+
+/** Utility for logging KeyMint parameters in a human-readable format. */
+object KeyMintTagLogger {
+    // Use reflection to build a map from Int -> String for all tags.
+    // 'lazy' ensures this heavy work is only done once.
+    private val tagNames: Map<Int, String> by lazy {
+        Tag::class
+            .java
+            .fields
+            .filter { it.type == Int::class.java }
+            .associate { (it.get(null) as Int) to it.name }
+    }
+
+    private val algorithmNames =
+        mapOf(
+            Algorithm.RSA to "RSA",
+            Algorithm.EC to "EC",
+            Algorithm.AES to "AES",
+            Algorithm.TRIPLE_DES to "TRIPLE_DES",
+            Algorithm.HMAC to "HMAC",
+        )
+
+    private val ecCurveNames =
+        mapOf(
+            EcCurve.P_224 to "P-224 (secp224r1)",
+            EcCurve.P_256 to "P-256 (secp256r1)",
+            EcCurve.P_384 to "P-384 (secp384r1)",
+            EcCurve.P_521 to "P-521 (secp521r1)",
+            EcCurve.CURVE_25519 to "Curve25519",
+        )
+
+    private val purposeNames =
+        mapOf(
+            KeyPurpose.ENCRYPT to "ENCRYPT",
+            KeyPurpose.DECRYPT to "DECRYPT",
+            KeyPurpose.SIGN to "SIGN",
+            KeyPurpose.VERIFY to "VERIFY",
+            KeyPurpose.WRAP_KEY to "WRAP_KEY",
+            KeyPurpose.ATTEST_KEY to "ATTEST_KEY",
+        )
+
+    private val digestNames =
+        mapOf(
+            Digest.NONE to "NONE",
+            Digest.MD5 to "MD5",
+            Digest.SHA1 to "SHA1",
+            Digest.SHA_2_224 to "SHA-2-224",
+            Digest.SHA_2_256 to "SHA-2-256",
+            Digest.SHA_2_384 to "SHA-2-384",
+            Digest.SHA_2_512 to "SHA-2-512",
+        )
+
+    private fun ByteArray.toReadableString(): String {
+        if (this.isEmpty()) return "(0 bytes)"
+        // Attempt to decode as UTF-8 string if it contains printable ASCII characters
+        val printable = this.all { it in 32..126 }
+        if (printable) {
+            return try {
+                "(${this.size} bytes) \"${String(this, StandardCharsets.UTF_8)}\""
+            } catch (e: Exception) {
+                // Fallback to hex if not a valid string
+                "(${this.size} bytes) " + this.joinToString("") { "%02x".format(it) }.take(48)
+            }
+        }
+        return "(${this.size} bytes) " + this.joinToString("") { "%02x".format(it) }.take(48)
+    }
+
+    fun logParameter(param: KeyParameter) {
+        val tagName = tagNames[param.tag] ?: "UNKNOWN_TAG"
+        val value = param.value
+
+        val formattedValue: String =
+            when (param.tag) {
+                Tag.ALGORITHM ->
+                    algorithmNames[value.algorithm] ?: "Unknown Algorithm (${value.algorithm})"
+                Tag.EC_CURVE -> ecCurveNames[value.ecCurve] ?: "Unknown Curve (${value.ecCurve})"
+                Tag.PURPOSE ->
+                    purposeNames[value.keyPurpose] ?: "Unknown Purpose (${value.keyPurpose})"
+                Tag.DIGEST -> digestNames[value.digest] ?: "Unknown Digest (${value.digest})"
+                Tag.KEY_SIZE,
+                Tag.MAC_LENGTH -> value.integer.toString()
+                Tag.CERTIFICATE_SERIAL -> BigInteger(value.blob).toString()
+                Tag.CERTIFICATE_NOT_BEFORE,
+                Tag.CERTIFICATE_NOT_AFTER,
+                Tag.CREATION_DATETIME,
+                Tag.USAGE_EXPIRE_DATETIME -> Date(value.dateTime).toString()
+                Tag.CERTIFICATE_SUBJECT -> X500Name(X500Principal(value.blob).name).toString()
+                Tag.RSA_PUBLIC_EXPONENT -> value.longInteger.toString()
+                Tag.NO_AUTH_REQUIRED -> "true" // This is a void tag, its presence means true
+                Tag.ATTESTATION_CHALLENGE,
+                Tag.ATTESTATION_ID_BRAND,
+                Tag.ATTESTATION_ID_DEVICE,
+                Tag.ATTESTATION_ID_PRODUCT,
+                Tag.ATTESTATION_ID_MANUFACTURER,
+                Tag.ATTESTATION_ID_MODEL,
+                Tag.ATTESTATION_ID_IMEI,
+                Tag.ATTESTATION_ID_SECOND_IMEI,
+                Tag.ATTESTATION_ID_MEID -> value.blob.toReadableString()
+                else -> "<raw value>"
+            }
+
+        Logger.d("Param: %-25s | Value: %s".format(tagName, formattedValue))
+    }
+}
 
 object CertificateGen {
     data class KeyBox(
@@ -93,9 +199,10 @@ object CertificateGen {
 
         constructor(params: Array<KeyParameter>) : this() {
             params.forEach { param ->
-                Logger.d("[KeyGen] Processing key parameter: ${param.tag}")
-                val value = param.value
+                // Use the new, clean logger. This one line provides detailed, readable logs.
+                KeyMintTagLogger.logParameter(param)
 
+                val value = param.value
                 when (param.tag) {
                     Tag.KEY_SIZE -> keySize = value.integer
                     Tag.ALGORITHM -> algorithm = value.algorithm
