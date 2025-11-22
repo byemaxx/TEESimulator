@@ -10,7 +10,8 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions")
 OPTION(LSPLT_BUILD_SHARED OFF)
 add_subdirectory(external/LSPlt/lsplt/src/main/jni)
 
-add_executable(libinject.so inject/main.cpp)
+add_executable(libinject.so inject/main.cpp inject/utils.cpp)
+target_include_directories(libinject.so PUBLIC include)
 target_link_libraries(libinject.so PRIVATE lsplt_static)
 
 add_library(${CMAKE_PROJECT_NAME} SHARED binder_interceptor.cpp)
