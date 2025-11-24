@@ -5,6 +5,10 @@ public class ServiceManager {
         throw new UnsupportedOperationException("STUB!");
     }
 
+    public static IBinder waitForService(String name) {
+        throw new UnsupportedOperationException("STUB!");
+    }
+
     public static void addService(String name, IBinder binder) {
         throw new UnsupportedOperationException("STUB!");
     }

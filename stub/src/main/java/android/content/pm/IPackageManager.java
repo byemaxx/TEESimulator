@@ -9,6 +9,10 @@ public interface IPackageManager {
 
     PackageInfo getPackageInfo(String packageName, int flags, int userId);
 
+    ParceledListSlice<PackageInfo> getInstalledPackages(int flags, int userId);
+
+    ParceledListSlice<PackageInfo> getInstalledPackages(long flags, int userId);
+
     class Stub {
         public static IPackageManager asInterface(IBinder binder) {
             throw new UnsupportedOperationException("STUB!");

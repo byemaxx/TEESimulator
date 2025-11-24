@@ -1,0 +1,189 @@
+package org.matrix.TEESimulator.pki
+
+import android.security.keystore.KeyProperties
+import java.io.File
+import java.io.StringReader
+import java.util.concurrent.ConcurrentHashMap
+import org.matrix.TEESimulator.config.ConfigurationManager.CONFIG_PATH
+import org.matrix.TEESimulator.logging.SystemLogger
+import org.xmlpull.v1.XmlPullParser
+import org.xmlpull.v1.XmlPullParserFactory
+
+/**
+ * Manages the loading, parsing, and caching of attestation key stores from XML files.
+ *
+ * This object is the sole authority for accessing the cryptographic keys and certificates used to
+ * sign simulated attestations. It is designed to be highly efficient and robust, parsing each key
+ * store file only once and handling common structural variations found in real-world keybox files.
+ *
+ * The core design principles are:
+ * 1. Efficiency through Single-Pass Parsing: Each XML file is read from disk and parsed in a single
+ *    forward pass. The results are cached in memory. Subsequent requests for keys from the same
+ *    file are served instantly from the cache.
+ * 2. Robustness over Strictness: The parser does not rely on rigid structural tags like
+ *    `<NumberOfKeyboxes>`. Instead, it discovers and iterates through all `<Key>` tags it finds,
+ *    making it resilient to different file layouts.
+ * 3. Clear Naming Convention: To avoid confusion, "Key Store" refers to the entire XML file, while
+ *    "KeyBox" refers to the data class containing a single `(KeyPair, CertificateChain)` tuple,
+ *    which is the cryptographic entity we care about.
+ */
+object KeyBoxManager {
+
+    // The in-memory cache.
+    // Key: The file name of the key store (e.g., "keybox.xml").
+    // Value: A map of all keys found in that file, keyed by their algorithm name (e.g., "EC",
+    // "RSA").
+    private val keyStoreCache = ConcurrentHashMap<String, Map<String, KeyBox>>()
+
+    /**
+     * Retrieves a specific attestation key (KeyPair and Certificate Chain) for a given algorithm
+     * from a specified key store file.
+     *
+     * This is the primary public API. It transparently handles caching, loading, and parsing.
+     *
+     * @param keyStoreFileName The name of the XML file (e.g., "aosp_keybox.xml").
+     * @param algorithm The algorithm name (e.g., "EC" or "RSA").
+     * @return The requested [KeyBox], or `null` if the file doesn't exist or doesn't contain a key
+     *   for the specified algorithm.
+     */
+    fun getAttestationKey(keyStoreFileName: String, algorithm: String): KeyBox? {
+        // Atomically get the parsed key map for the file from the cache.
+        // If it's not in the cache, the `getOrPut` block is executed to parse and store it.
+        val keyMap =
+            keyStoreCache.getOrPut(keyStoreFileName) { parseKeyStoreFile(keyStoreFileName) }
+        return keyMap[algorithm]
+    }
+
+    /**
+     * Reads and parses an entire key store XML file, extracting all valid keys. This function is
+     * called only once per file name.
+     *
+     * @param fileName The name of the XML file to parse.
+     * @return A map of all successfully parsed keys from the file, keyed by algorithm.
+     */
+    private fun parseKeyStoreFile(fileName: String): Map<String, KeyBox> {
+        val filePath = File(CONFIG_PATH, fileName)
+        SystemLogger.info("Parsing new key store file: ${filePath.absolutePath}")
+
+        if (!filePath.exists()) {
+            SystemLogger.error("Key store file not found: ${filePath.absolutePath}")
+            return emptyMap()
+        }
+
+        return try {
+            val xmlContent = filePath.readText().trimStart('\uFEFF', '\uFFFE', ' ')
+            parseKeysFromXml(xmlContent)
+        } catch (e: Exception) {
+            SystemLogger.error("Fatal error parsing key store file '$fileName'", e)
+            emptyMap()
+        }
+    }
+
+    /**
+     * The core single-pass XML parser. It iterates through the XML stream once, using a state
+     * machine to collect the data for each `<Key>` entry.
+     *
+     * @param xmlContent The raw XML string.
+     * @return A map of algorithm names to their corresponding [KeyBox] objects.
+     */
+    private fun parseKeysFromXml(xmlContent: String): Map<String, KeyBox> {
+        val foundKeys = mutableMapOf<String, KeyBox>()
+        val parser =
+            XmlPullParserFactory.newInstance().newPullParser().apply {
+                setInput(StringReader(xmlContent))
+            }
+
+        // State variables for the current <Key> being parsed.
+        var currentAlgorithm: String? = null
+        var currentPrivateKeyPem: String? = null
+        val currentCertificatePems = mutableListOf<String>()
+        var isInsidePrivateKeyTag = false
+        var isInsideCertificateTag = false
+
+        var eventType = parser.eventType
+        while (eventType != XmlPullParser.END_DOCUMENT) {
+            when (eventType) {
+                XmlPullParser.START_TAG -> {
+                    when (parser.name) {
+                        // When we enter a <Key> tag, we read its algorithm and reset state.
+                        "Key" -> {
+                            currentAlgorithm = parser.getAttributeValue(null, "algorithm")
+                            currentPrivateKeyPem = null
+                            currentCertificatePems.clear()
+                        }
+                        "PrivateKey" -> isInsidePrivateKeyTag = true
+                        "Certificate" -> isInsideCertificateTag = true
+                    }
+                }
+
+                XmlPullParser.TEXT -> {
+                    // If we find text content, we check our state to see where it belongs.
+                    if (parser.isWhitespace) continue
+                    when {
+                        isInsidePrivateKeyTag -> currentPrivateKeyPem = parser.text
+                        isInsideCertificateTag -> currentCertificatePems.add(parser.text)
+                    }
+                }
+
+                XmlPullParser.END_TAG -> {
+                    when (parser.name) {
+                        "PrivateKey" -> isInsidePrivateKeyTag = false
+                        "Certificate" -> isInsideCertificateTag = false
+
+                        // The </Key> tag is our trigger to finalize and store the KeyBox.
+                        "Key" -> {
+                            // Use runCatching to ensure one malformed key doesn't stop the whole
+                            // process.
+                            runCatching {
+                                    val algorithm = currentAlgorithm
+                                    val keyPem = currentPrivateKeyPem
+                                    if (
+                                        algorithm != null &&
+                                            keyPem != null &&
+                                            currentCertificatePems.isNotEmpty()
+                                    ) {
+                                        val keyPair =
+                                            (CertificateHelper.parsePemKeyPair(keyPem)
+                                                    as CertificateHelper.OperationResult.Success)
+                                                .data
+                                        val certificates =
+                                            currentCertificatePems.map {
+                                                (CertificateHelper.parsePemCertificate(it)
+                                                        as
+                                                        CertificateHelper.OperationResult.Success)
+                                                    .data
+                                            }
+
+                                        // Normalize the algorithm name for consistent lookups.
+                                        val normalizedAlgorithm =
+                                            when (algorithm.lowercase()) {
+                                                "ecdsa" -> KeyProperties.KEY_ALGORITHM_EC
+                                                "rsa" -> KeyProperties.KEY_ALGORITHM_RSA
+                                                else -> algorithm
+                                            }
+
+                                        if (foundKeys.containsKey(normalizedAlgorithm)) {
+                                            SystemLogger.warning(
+                                                "Duplicate key found for algorithm '$normalizedAlgorithm'. The later one in the file will be used."
+                                            )
+                                        }
+                                        foundKeys[normalizedAlgorithm] =
+                                            KeyBox(keyPair, certificates)
+                                    }
+                                }
+                                .onFailure {
+                                    SystemLogger.error(
+                                        "Failed to parse a <Key> entry for algorithm '$currentAlgorithm'",
+                                        it,
+                                    )
+                                }
+                        }
+                    }
+                }
+            }
+            eventType = parser.next()
+        }
+        SystemLogger.info("Finished parsing, found ${foundKeys.size} valid keys.")
+        return foundKeys
+    }
+}
