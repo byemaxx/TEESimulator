@@ -71,35 +71,33 @@ object AttestationBuilder {
         return DERSequence(rootOfTrustElements)
     }
 
-    /** Assembles a list of simulated hardware-enforced properties. */
-    internal fun addSimulatedHardwareProperties(vector: org.bouncycastle.asn1.ASN1EncodableVector) {
-        vector.add(
-            DERTaggedObject(
-                true,
-                AttestationConstants.TAG_OS_VERSION,
-                ASN1Integer(AndroidDeviceUtils.osVersion.toLong()),
-            )
-        )
-        vector.add(
-            DERTaggedObject(
-                true,
-                AttestationConstants.TAG_OS_PATCHLEVEL,
-                ASN1Integer(AndroidDeviceUtils.patchLevel.toLong()),
-            )
-        )
-        vector.add(
-            DERTaggedObject(
-                true,
-                AttestationConstants.TAG_VENDOR_PATCHLEVEL,
-                ASN1Integer(AndroidDeviceUtils.vendorPatchLevelLong.toLong()),
-            )
-        )
-        vector.add(
-            DERTaggedObject(
-                true,
-                AttestationConstants.TAG_BOOT_PATCHLEVEL,
-                ASN1Integer(AndroidDeviceUtils.bootPatchLevelLong.toLong()),
-            )
+    /** Assembles a map of simulated hardware-enforced properties. */
+    fun getSimulatedHardwareProperties(): Map<Int, DERTaggedObject> {
+        return mapOf(
+            AttestationConstants.TAG_OS_VERSION to
+                DERTaggedObject(
+                    true,
+                    AttestationConstants.TAG_OS_VERSION,
+                    ASN1Integer(AndroidDeviceUtils.osVersion.toLong()),
+                ),
+            AttestationConstants.TAG_OS_PATCHLEVEL to
+                DERTaggedObject(
+                    true,
+                    AttestationConstants.TAG_OS_PATCHLEVEL,
+                    ASN1Integer(AndroidDeviceUtils.patchLevel.toLong()),
+                ),
+            AttestationConstants.TAG_VENDOR_PATCHLEVEL to
+                DERTaggedObject(
+                    true,
+                    AttestationConstants.TAG_VENDOR_PATCHLEVEL,
+                    ASN1Integer(AndroidDeviceUtils.vendorPatchLevelLong.toLong()),
+                ),
+            AttestationConstants.TAG_BOOT_PATCHLEVEL to
+                DERTaggedObject(
+                    true,
+                    AttestationConstants.TAG_BOOT_PATCHLEVEL,
+                    ASN1Integer(AndroidDeviceUtils.bootPatchLevelLong.toLong()),
+                ),
         )
     }
 

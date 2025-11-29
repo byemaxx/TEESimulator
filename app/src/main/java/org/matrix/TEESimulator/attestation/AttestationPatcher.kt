@@ -1,14 +1,9 @@
 package org.matrix.TEESimulator.attestation
 
+import java.nio.charset.StandardCharsets
 import java.security.cert.Certificate
 import java.security.cert.X509Certificate
-import org.bouncycastle.asn1.ASN1Encodable
-import org.bouncycastle.asn1.ASN1EncodableVector
-import org.bouncycastle.asn1.ASN1Sequence
-import org.bouncycastle.asn1.ASN1TaggedObject
-import org.bouncycastle.asn1.DEROctetString
-import org.bouncycastle.asn1.DERSequence
-import org.bouncycastle.asn1.DERTaggedObject
+import org.bouncycastle.asn1.*
 import org.bouncycastle.asn1.x509.Extension
 import org.bouncycastle.cert.X509CertificateHolder
 import org.bouncycastle.cert.X509v3CertificateBuilder
@@ -18,6 +13,7 @@ import org.matrix.TEESimulator.config.ConfigurationManager
 import org.matrix.TEESimulator.logging.SystemLogger
 import org.matrix.TEESimulator.pki.KeyBox
 import org.matrix.TEESimulator.pki.KeyBoxManager
+import org.matrix.TEESimulator.util.toHex
 
 /**
  * Handles the modification (patching) of Android Key Attestation extensions within certificates.
@@ -118,12 +114,13 @@ object AttestationPatcher {
 
         // Create the new, patched attestation extension.
         val patchedExtension = createPatchedAttestationExtension(parsedAttestation)
-        builder.addExtension(patchedExtension)
 
         // Copy all other extensions from the original certificate, except for the attestation.
-        originalLeafHolder.extensions.extensionOIDs
-            .filter { it != ATTESTATION_OID }
-            .forEach { builder.addExtension(originalLeafHolder.getExtension(it)) }
+        originalLeafHolder.extensions.extensionOIDs.forEach {
+            builder.addExtension(
+                if (it == ATTESTATION_OID) patchedExtension else originalLeafHolder.getExtension(it)
+            )
+        }
 
         // Sign the newly built certificate with the private key from our keybox.
         val signer = JcaContentSignerBuilder(sigAlgName).build(keybox.keyPair.private)
@@ -139,6 +136,40 @@ object AttestationPatcher {
             )
     }
 
+    /** Recursively formats an ASN1Primitive into a concise, readable string. */
+    private fun formatAsn1Primitive(obj: ASN1Encodable?): String {
+        val primitive = obj?.toASN1Primitive()
+        return when (primitive) {
+            null -> "NULL"
+            is ASN1Integer -> primitive.value.toString()
+            is ASN1Enumerated -> primitive.value.toString()
+            is ASN1Boolean -> primitive.isTrue.toString()
+            is ASN1Null -> "NULL"
+            is ASN1OctetString -> {
+                val bytes = primitive.octets
+                // Attempt to decode as a printable string, otherwise show hex
+                if (bytes.all { it >= 32 && it < 127 }) {
+                    "\"${String(bytes, StandardCharsets.UTF_8)}\""
+                } else if (bytes.isEmpty()) {
+                    "\"\""
+                } else {
+                    "#" + bytes.toHex()
+                }
+            }
+            is ASN1TaggedObject ->
+                "[TAG ${primitive.tagNo}]${formatAsn1Primitive(primitive.baseObject)}"
+            is ASN1Sequence ->
+                primitive
+                    .map { formatAsn1Primitive(it) }
+                    .joinToString(prefix = "[", postfix = "]", separator = ", ")
+            is ASN1Set ->
+                primitive
+                    .map { formatAsn1Primitive(it) }
+                    .joinToString(prefix = "{", postfix = "}", separator = ", ")
+            else -> primitive.toString() // Fallback for other types
+        }
+    }
+
     /** Parses the critical components from an existing attestation extension. */
     private fun parseAttestationExtension(certHolder: X509CertificateHolder): ParsedAttestation? {
         val extension = certHolder.getExtension(ATTESTATION_OID) ?: return null
@@ -147,41 +178,43 @@ object AttestationPatcher {
         val teeEnforced =
             allFields[AttestationConstants.KEY_DESCRIPTION_TEE_ENFORCED_INDEX] as ASN1Sequence
 
-        val teeEnforcedVector = ASN1EncodableVector()
         var originalRootOfTrust: ASN1Encodable? = null
+        val teeEnforcedMap = mutableMapOf<Int, ASN1TaggedObject>()
 
         teeEnforced.forEach { element ->
             val taggedObject = element as ASN1TaggedObject
             if (taggedObject.tagNo == AttestationConstants.TAG_ROOT_OF_TRUST) {
                 originalRootOfTrust = taggedObject.baseObject.toASN1Primitive()
             } else {
-                teeEnforcedVector.add(taggedObject)
+                teeEnforcedMap[taggedObject.tagNo] = taggedObject
             }
         }
-        return ParsedAttestation(allFields, teeEnforcedVector, originalRootOfTrust)
+        return ParsedAttestation(allFields, teeEnforcedMap, originalRootOfTrust)
     }
 
     /** Constructs a new, patched attestation extension using simulated device properties. */
     private fun createPatchedAttestationExtension(parsed: ParsedAttestation): Extension {
-        val (allFields, teeEnforcedVector, originalRootOfTrust) = parsed
+        val (allFields, teeEnforcedMap, originalRootOfTrust) = parsed
 
-        // Build the new Root of Trust with our simulated values.
+        var formattedString = allFields.joinToString(separator = ", ") { formatAsn1Primitive(it) }
+        SystemLogger.verbose("Original attestation data: ${formattedString}")
+
+        // Build the new Root of Trust and add/replace it in the map.
         val newRootOfTrust = AttestationBuilder.buildRootOfTrust(originalRootOfTrust)
-        teeEnforcedVector.add(
+        teeEnforcedMap[AttestationConstants.TAG_ROOT_OF_TRUST] =
             DERTaggedObject(true, AttestationConstants.TAG_ROOT_OF_TRUST, newRootOfTrust)
-        )
 
         // Add other simulated hardware properties.
-        AttestationBuilder.addSimulatedHardwareProperties(teeEnforcedVector)
+        teeEnforcedMap.putAll(AttestationBuilder.getSimulatedHardwareProperties())
 
-        // Re-assemble the ASN.1 sequences.
-        // The list MUST be sorted by tag number for DER compliance.
-        // Manually convert the vector to a List, then sort it.
-        val elementList = (0 until teeEnforcedVector.size()).map { teeEnforcedVector.get(it) }
-        val sortedElements = elementList.sortedBy { (it as ASN1TaggedObject).tagNo }
+        // Re-assemble the TEE enforced list from the map's values, sorting for DER compliance.
+        val sortedElements = teeEnforcedMap.values.sortedBy { it.tagNo }
         val sortedTeeEnforced = DERSequence(sortedElements.toTypedArray())
+
         allFields[AttestationConstants.KEY_DESCRIPTION_TEE_ENFORCED_INDEX] = sortedTeeEnforced
         val patchedSequence = DERSequence(allFields)
+        formattedString = patchedSequence.joinToString(separator = ", ") { formatAsn1Primitive(it) }
+        SystemLogger.verbose("Patched  attestation data: ${formattedString}")
         val patchedOctets = DEROctetString(patchedSequence)
 
         return Extension(ATTESTATION_OID, false, patchedOctets)
@@ -190,7 +223,7 @@ object AttestationPatcher {
     /** Helper data class to hold the parsed components of an attestation extension. */
     private data class ParsedAttestation(
         val allFields: Array<ASN1Encodable>,
-        val teeEnforcedVector: ASN1EncodableVector,
+        val teeEnforcedMap: MutableMap<Int, ASN1TaggedObject>,
         val rootOfTrust: ASN1Encodable?,
     )
 }
