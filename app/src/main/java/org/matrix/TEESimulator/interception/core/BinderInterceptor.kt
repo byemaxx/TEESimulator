@@ -229,14 +229,19 @@ abstract class BinderInterceptor : Binder() {
         callingPid: Int,
         isIntercepting: Boolean = true,
     ) {
-        val isSkipUid = ConfigurationManager.shouldSkipUid(callingUid)
-        if (isSkipUid && !BuildConfig.DEBUG) return
-
+        if (isIntercepting) {
+            val isSkipUid = ConfigurationManager.shouldSkipUid(callingUid)
+            if (isSkipUid && !BuildConfig.DEBUG) return
+        }
         val action = if (isIntercepting) "Intercept" else "Observe"
         val packages = ConfigurationManager.getPackagesForUid(callingUid).joinToString()
-        SystemLogger.debug(
+        val message =
             "[TX_ID: $txId] $action $methodName for packages=[$packages] (uid=$callingUid, pid=$callingPid)"
-        )
+        if (isIntercepting) {
+            SystemLogger.debug(message)
+        } else {
+            SystemLogger.verbose(message)
+        }
     }
 
     companion object {
