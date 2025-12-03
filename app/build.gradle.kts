@@ -56,9 +56,7 @@ android {
         sourceCompatibility = JavaVersion.VERSION_21
         targetCompatibility = JavaVersion.VERSION_21
     }
-    buildFeatures {
-        buildConfig = true
-    }
+    buildFeatures { buildConfig = true }
     externalNativeBuild {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")

@@ -125,7 +125,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 transactionNames[code] ?: "unknown code=$code",
                 callingUid,
                 callingPid,
-                false,
+                true,
             )
         }
 

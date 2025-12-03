@@ -61,7 +61,7 @@ class KeyMintSecurityLevelInterceptor(
                 transactionNames[code] ?: "unknown code=$code",
                 callingUid,
                 callingPid,
-                false,
+                true,
             )
         }
         return TransactionResult.ContinueAndSkipPost
