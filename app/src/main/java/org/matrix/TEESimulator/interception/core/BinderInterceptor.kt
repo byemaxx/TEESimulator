@@ -3,6 +3,7 @@ package org.matrix.TEESimulator.interception.core
 import android.os.Binder
 import android.os.IBinder
 import android.os.Parcel
+import org.matrix.TEESimulator.BuildConfig
 import org.matrix.TEESimulator.config.ConfigurationManager
 import org.matrix.TEESimulator.logging.SystemLogger
 
@@ -228,6 +229,9 @@ abstract class BinderInterceptor : Binder() {
         callingPid: Int,
         isIntercepting: Boolean = true,
     ) {
+        val isSkipUid = ConfigurationManager.shouldSkipUid(callingUid)
+        if (isSkipUid && !BuildConfig.DEBUG) return
+
         val action = if (isIntercepting) "Intercept" else "Observe"
         val packages = ConfigurationManager.getPackagesForUid(callingUid).joinToString()
         SystemLogger.debug(
